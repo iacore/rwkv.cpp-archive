@@ -132,130 +132,24 @@ struct rwkv_context {
     bool freed;
 };
 
-struct rwkv_context * rwkv_init_from_file(const char * file_path, uint32_t n_threads) {
-    FILE * file = fopen(file_path, "rb");
-    RWKV_ASSERT_NULL(file != NULL, "Failed to open file %s", file_path);
+struct build_graph_result {
+    struct ggml_tensor * token_index;
+    struct ggml_tensor * state;
+    struct ggml_tensor ** state_parts;
+    struct ggml_tensor * logits;
+    struct ggml_cgraph * graph;
+    bool failure;
+};
 
-    int32_t magic;
-    read_int32(file, &magic);
-    RWKV_ASSERT_NULL(magic == RWKV_FILE_MAGIC, "Unexpected magic value %d", magic);
-
-    int32_t version;
-    read_int32(file, &version);
-    RWKV_ASSERT_NULL(version == RWKV_FILE_VERSION, "Unsupported file version %d", version);
-
-    struct rwkv_model * model = (struct rwkv_model *) calloc(1, sizeof(struct rwkv_model));
-
-    read_int32(file, &(model->n_vocab));
-    RWKV_ASSERT_NULL(model->n_vocab > 0, "Non-positive n_vocab %d", model->n_vocab);
-
-    read_int32(file, &(model->n_embed));
-    RWKV_ASSERT_NULL(model->n_embed > 0, "Non-positive n_embed %d", model->n_embed);
-
-    read_int32(file, &(model->n_layer));
-    RWKV_ASSERT_NULL(model->n_layer > 0, "Non-positive n_layer %d", model->n_layer);
-
-    read_int32(file, &(model->data_type));
-    RWKV_ASSERT_NULL(
-        model->data_type == 0 ||
-            model->data_type == 1 ||
-            model->data_type == 2 ||
-            model->data_type == 3,
-        "Unsupported model data type %d",
-        model->data_type
-    );
-
-    // Parameter tensors would take at least this amount in memory.
-    size_t file_size;
-
-    {
-        auto fin = std::ifstream(file_path, std::ios::binary);
-        RWKV_ASSERT_NULL(fin, "Failed to open file %s", file_path);
-        fin.seekg(0, fin.end);
-        file_size = fin.tellg();
-        fin.close();
-    }
-
-    size_t memory_required = file_size +
-        // Intermediary vectors for calculation; there are around 100 calls to ggml
-        size_t(100) * model->n_embed * sizeof(float) +
-        // State, in and out
-        size_t(2) * 5 * model->n_layer * model->n_embed * sizeof(float) +
-        // Logits
-        size_t(model->n_vocab) * sizeof(float) +
-        // +256 MB just for any overhead
-        // TODO This is too much for smaller models; need a more proper and robust way of measuring required memory
-        size_t(256) * 1024 * 1024;
-
-    // Initialize ggml
-    struct ggml_init_params params;
-    params.mem_size = memory_required;
-    params.mem_buffer = NULL;
-    struct ggml_context * ctx = ggml_init(params);
-
-    std::unordered_map<std::string, struct ggml_tensor *> parameters;
-
-    while (true) {
-        int32_t dim_count;
-        size_t elements_read = fread(&dim_count, 4, 1, file);
-
-        if (feof(file)) {
-            break;
-        }
-
-        RWKV_ASSERT_NULL(elements_read == 1, "Failed to read dimension count");
-        RWKV_ASSERT_NULL(dim_count == 1 || dim_count == 2, "Unsupported dimension count %d", dim_count);
-
-        int32_t key_length;
-        read_int32(file, &key_length);
-        RWKV_ASSERT_NULL(key_length > 0, "Non-positive key length %d", key_length);
-
-        int32_t data_type;
-        read_int32(file, &data_type);
-        RWKV_ASSERT_NULL(
-            data_type == 0 ||
-                data_type == 1 ||
-                data_type == 2 ||
-                data_type == 3,
-            "Unsupported parameter data type %d",
-            data_type
-        );
-
-        ggml_type ggml_data_type;
-
-        switch (data_type) {
-            case 0: ggml_data_type = GGML_TYPE_F32; break;
-            case 1: ggml_data_type = GGML_TYPE_F16; break;
-            case 2: ggml_data_type = GGML_TYPE_Q4_0; break;
-            case 3: ggml_data_type = GGML_TYPE_Q4_1; break;
-            default: return NULL;
-        }
-
-        struct ggml_tensor * tensor;
-
-        int32_t x = -1;
-        int32_t y = -1;
-
-        if (dim_count == 1) {
-            read_int32(file, &x);
-            tensor = ggml_new_tensor_1d(ctx, ggml_data_type, x);
-        } else if (dim_count == 2) {
-            read_int32(file, &x);
-            read_int32(file, &y);
-            tensor = ggml_new_tensor_2d(ctx, ggml_data_type, x, y);
-        } else {
-            abort();
-        }
-
-        std::string key(key_length, 0);
-        RWKV_ASSERT_NULL(fread(&key[0], 1, key_length, file) == uint32_t(key_length), "Failed to read parameter key");
-
-        RWKV_ASSERT_NULL(fread(tensor->data, 1, ggml_nbytes(tensor), file) == ggml_nbytes(tensor), "Failed to read parameter data");
-
-        parameters[key] = tensor;
-    }
-
-    fclose(file);
+struct build_graph_result build_graph(struct ggml_context * ctx, std::unordered_map<std::string, struct ggml_tensor *> &parameters, struct rwkv_model * model) {
+#define RWKV_ASSERT_RET_FAIL(x, ...) \
+    do { \
+        if (!(x)) { \
+            fprintf(stderr, __VA_ARGS__); \
+            fprintf(stderr, "\n%s:%d: %s\n", __FILE__, __LINE__, #x); \
+            return (struct build_graph_result){ .failure = true }; \
+        } \
+    } while (0)
 
     model->layers.resize(model->n_layer);
 
@@ -299,9 +193,9 @@ struct rwkv_context * rwkv_init_from_file(const char * file_path, uint32_t n_thr
 
     // Verify order of dimensions
     struct ggml_tensor * emb = model->emb;
-    RWKV_ASSERT_NULL(emb->n_dims == 2, "Unexpected dimension count of embedding matrix %d", emb->n_dims);
-    RWKV_ASSERT_NULL(emb->ne[0] == model->n_embed, "Unexpected dimension of embedding matrix %d", emb->ne[0]);
-    RWKV_ASSERT_NULL(emb->ne[1] == model->n_vocab, "Unexpected dimension of embedding matrix %d", emb->ne[1]);
+    RWKV_ASSERT_RET_FAIL(emb->n_dims == 2, "Unexpected dimension count of embedding matrix %d", emb->n_dims);
+    RWKV_ASSERT_RET_FAIL(emb->ne[0] == model->n_embed, "Unexpected dimension of embedding matrix %d", emb->ne[0]);
+    RWKV_ASSERT_RET_FAIL(emb->ne[1] == model->n_vocab, "Unexpected dimension of embedding matrix %d", emb->ne[1]);
 
     int32_t n_embed = model->n_embed;
     int32_t n_layer = model->n_layer;
@@ -479,17 +373,147 @@ struct rwkv_context * rwkv_init_from_file(const char * file_path, uint32_t n_thr
     for (int i = 0; i < n_layer * 5; i++) {
        ggml_build_forward_expand(graph, state_parts[i]);
     }
+    return { token_index,state,state_parts,logits,graph,false };
+}
 
-    graph->n_threads = n_threads;
+struct rwkv_context * rwkv_init_from_file(const char * file_path, uint32_t n_threads) {
+    FILE * file = fopen(file_path, "rb");
+    RWKV_ASSERT_NULL(file != NULL, "Failed to open file %s", file_path);
+
+    int32_t magic;
+    read_int32(file, &magic);
+    RWKV_ASSERT_NULL(magic == RWKV_FILE_MAGIC, "Unexpected magic value %d", magic);
+
+    int32_t version;
+    read_int32(file, &version);
+    RWKV_ASSERT_NULL(version == RWKV_FILE_VERSION, "Unsupported file version %d", version);
+
+    struct rwkv_model * model = (struct rwkv_model *) calloc(1, sizeof(struct rwkv_model));
+
+    read_int32(file, &(model->n_vocab));
+    RWKV_ASSERT_NULL(model->n_vocab > 0, "Non-positive n_vocab %d", model->n_vocab);
+
+    read_int32(file, &(model->n_embed));
+    RWKV_ASSERT_NULL(model->n_embed > 0, "Non-positive n_embed %d", model->n_embed);
+
+    read_int32(file, &(model->n_layer));
+    RWKV_ASSERT_NULL(model->n_layer > 0, "Non-positive n_layer %d", model->n_layer);
+
+    read_int32(file, &(model->data_type));
+    RWKV_ASSERT_NULL(
+        model->data_type == 0 ||
+            model->data_type == 1 ||
+            model->data_type == 2 ||
+            model->data_type == 3,
+        "Unsupported model data type %d",
+        model->data_type
+    );
+
+    // Parameter tensors would take at least this amount in memory.
+    size_t file_size;
+
+    {
+        auto fin = std::ifstream(file_path, std::ios::binary);
+        RWKV_ASSERT_NULL(fin, "Failed to open file %s", file_path);
+        fin.seekg(0, fin.end);
+        file_size = fin.tellg();
+        fin.close();
+    }
+
+    size_t memory_required = file_size +
+        // Intermediary vectors for calculation; there are around 100 calls to ggml
+        size_t(100) * model->n_embed * sizeof(float) +
+        // State, in and out
+        size_t(2) * 5 * model->n_layer * model->n_embed * sizeof(float) +
+        // Logits
+        size_t(model->n_vocab) * sizeof(float) +
+        // +256 MB just for any overhead
+        // TODO This is too much for smaller models; need a more proper and robust way of measuring required memory
+        size_t(256) * 1024 * 1024;
+
+    // Initialize ggml
+    struct ggml_init_params params;
+    params.mem_size = memory_required;
+    params.mem_buffer = NULL;
+    struct ggml_context * ctx = ggml_init(params);
+
+    std::unordered_map<std::string, struct ggml_tensor *> parameters;
+
+    while (true) {
+        int32_t dim_count;
+        size_t elements_read = fread(&dim_count, 4, 1, file);
+
+        if (feof(file)) {
+            break;
+        }
+
+        RWKV_ASSERT_NULL(elements_read == 1, "Failed to read dimension count");
+        RWKV_ASSERT_NULL(dim_count == 1 || dim_count == 2, "Unsupported dimension count %d", dim_count);
+
+        int32_t key_length;
+        read_int32(file, &key_length);
+        RWKV_ASSERT_NULL(key_length > 0, "Non-positive key length %d", key_length);
+
+        int32_t data_type;
+        read_int32(file, &data_type);
+        RWKV_ASSERT_NULL(
+            data_type == 0 ||
+                data_type == 1 ||
+                data_type == 2 ||
+                data_type == 3,
+            "Unsupported parameter data type %d",
+            data_type
+        );
+
+        ggml_type ggml_data_type;
+
+        switch (data_type) {
+            case 0: ggml_data_type = GGML_TYPE_F32; break;
+            case 1: ggml_data_type = GGML_TYPE_F16; break;
+            case 2: ggml_data_type = GGML_TYPE_Q4_0; break;
+            case 3: ggml_data_type = GGML_TYPE_Q4_1; break;
+            default: return NULL;
+        }
+
+        struct ggml_tensor * tensor;
+
+        int32_t x = -1;
+        int32_t y = -1;
+
+        if (dim_count == 1) {
+            read_int32(file, &x);
+            tensor = ggml_new_tensor_1d(ctx, ggml_data_type, x);
+        } else if (dim_count == 2) {
+            read_int32(file, &x);
+            read_int32(file, &y);
+            tensor = ggml_new_tensor_2d(ctx, ggml_data_type, x, y);
+        } else {
+            abort();
+        }
+
+        std::string key(key_length, 0);
+        RWKV_ASSERT_NULL(fread(&key[0], 1, key_length, file) == uint32_t(key_length), "Failed to read parameter key");
+
+        RWKV_ASSERT_NULL(fread(tensor->data, 1, ggml_nbytes(tensor), file) == ggml_nbytes(tensor), "Failed to read parameter data");
+
+        parameters[key] = tensor;
+    }
+
+    fclose(file);
+
+    auto res = build_graph(ctx, parameters, model);
+    if (res.failure) return NULL;
+
+    res.graph->n_threads = n_threads;
 
     struct rwkv_context * rwkv_ctx = (struct rwkv_context *) calloc(1, sizeof(struct rwkv_context));
     rwkv_ctx->model = model;
-    rwkv_ctx->token_index = token_index;
-    rwkv_ctx->state = state;
-    rwkv_ctx->state_parts = state_parts;
-    rwkv_ctx->logits = logits;
+    rwkv_ctx->token_index = res.token_index;
+    rwkv_ctx->state = res.state;
+    rwkv_ctx->state_parts = res.state_parts;
+    rwkv_ctx->logits = res.logits;
     rwkv_ctx->ctx = ctx;
-    rwkv_ctx->graph = graph;
+    rwkv_ctx->graph = res.graph;
     return rwkv_ctx;
 }
 
